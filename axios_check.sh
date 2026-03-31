@@ -146,17 +146,6 @@ if [[ $C2_FOUND -eq 0 ]]; then
   safe "No active C2 / exfiltration connections detected"
 fi
 
-# DNS resolution check for both domains
-if command -v dig &>/dev/null; then
-  for c2_domain in sfrclak.com packages.npm.org; do
-    C2_IP=$(dig +short "$c2_domain" 2>/dev/null || true)
-    if [[ -n "$C2_IP" ]]; then
-      info "$c2_domain resolves to: $C2_IP"
-      info "Check firewall/DNS logs for connections to this IP"
-    fi
-  done
-fi
-
 # ---- Check for evidence of past requests to exfiltration endpoints ----
 info ""
 info "Checking for evidence of past requests to packages.npm.org/product{0,1,2}..."
@@ -284,9 +273,9 @@ check_global_package() {
   local manager="$2"
   local list_output="$3"
 
-  if echo "$list_output" | grep -q "$pkg"; then
+  if echo "$list_output" | grep -qF "$pkg"; then
     found "$pkg found in global $manager packages!"
-    echo "$list_output" | grep "$pkg" | sed 's/^/    /'
+    echo "$list_output" | grep -F "$pkg" | sed 's/^/    /'
   fi
 }
 
