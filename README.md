@@ -4,7 +4,7 @@ This repository contains a single Bash script that scans a workstation or a dire
 
 It is designed to be practical for responders and developers. It checks lockfiles, `node_modules`, npm cache, global installs, a few known filesystem IOCs, and active network connections.
 
-**For full incident context, detection playbook, and containment checklist, see the [CyberReplay axios npm compromise write-up](https://cyberreplay.com/blog/axies-compromised-on-npm-malicious-releases-remote-access-trojan/).**
+**For fully updated incident context, detection playbook, and containment checklist, see the [CyberReplay axios npm compromise write-up](https://cyberreplay.com/blog/axies-compromised-on-npm-malicious-releases-remote-access-trojan/).**
 
 ## What it checks
 
