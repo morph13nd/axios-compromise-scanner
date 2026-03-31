@@ -6,11 +6,12 @@
 #
 # Scans for:
 #   1. Compromised axios versions (1.14.1, 0.30.4) in lockfiles & node_modules
-#   2. Malicious package "plain-crypto-js" anywhere on disk
+#   2. Malicious packages: plain-crypto-js, @shadanai/openclaw, @qqbrowser/openclaw-qbot
 #   3. Platform-specific stage-2 payload IOCs (filesystem)
-#   4. Active C2 connections to sfrclak.com
+#   4. Active C2 connections to sfrclak.com / 142.11.206.73
 #   5. Global npm/yarn/pnpm packages
 #   6. npm cache contamination
+#   7. Exfiltration to packages.npm.org/product{0,1,2}
 #
 # Usage:
 #   chmod +x scan_axios_compromise.sh
@@ -82,6 +83,20 @@ if [[ "$OS" == "Darwin" ]]; then
   else
     safe "No macOS stage-2 binary found"
   fi
+
+  # macOS RAT drops ad-hoc signed binaries to /private/tmp/.*
+  RAT_TEMPS=$(find /private/tmp -maxdepth 1 -name ".*" -type f -perm +0111 2>/dev/null | head -10 || true)
+  if [[ -n "$RAT_TEMPS" ]]; then
+    warn "Hidden executable(s) in /private/tmp (consistent with RAT peinject command):"
+    echo "$RAT_TEMPS" | sed 's/^/    /'
+  fi
+
+  # macOS RAT writes .scpt files to /tmp for osascript execution
+  RAT_SCPT=$(find /tmp /private/tmp -maxdepth 1 -name ".*.scpt" 2>/dev/null | head -10 || true)
+  if [[ -n "$RAT_SCPT" ]]; then
+    found "Hidden .scpt file(s) in /tmp (RAT runscript artifact):"
+    echo "$RAT_SCPT" | sed 's/^/    /'
+  fi
 fi
 
 # Linux
@@ -109,18 +124,28 @@ if [[ -d "/mnt/c" ]] || [[ "$OS" == "MINGW"* ]] || [[ "$OS" == "MSYS"* ]]; then
   safe "Windows IOC check complete"
 fi
 
+# All platforms — $TMPDIR/6202033 temp file
+TMPDIR_CHECK="${TMPDIR:-/tmp}"
+if [[ -f "${TMPDIR_CHECK}/6202033" ]] || [[ -f "/tmp/6202033" ]]; then
+  found "Temp file 6202033 found (dropper artifact):"
+  ls -la "${TMPDIR_CHECK}/6202033" "/tmp/6202033" 2>/dev/null | sed 's/^/    /' || true
+else
+  safe "No 6202033 temp file found"
+fi
+
 # ============================================================================
 # 2. NETWORK — Active C2 Connections
 # ============================================================================
 section "Checking for active connections to C2 / exfiltration domains"
 
-# Domains used by the compromise:
+# Domains and IPs used by the compromise:
 #   sfrclak.com           — stage-2 C2 callback
+#   142.11.206.73         — C2 IP address
 #   packages.npm.org      — data exfiltration via POST
 #     POST /product0      — macOS payload
 #     POST /product1      — Windows payload
 #     POST /product2      — Linux payload
-C2_DOMAINS=("sfrclak" "packages.npm.org")
+C2_DOMAINS=("sfrclak" "packages.npm.org" "142.11.206.73")
 C2_FOUND=0
 
 check_net_tool() {
@@ -286,6 +311,8 @@ if command -v npm &>/dev/null; then
   check_global_package "axios@1.14.1" "npm" "$NPM_GLOBAL"
   check_global_package "axios@0.30.4" "npm" "$NPM_GLOBAL"
   check_global_package "plain-crypto-js" "npm" "$NPM_GLOBAL"
+  check_global_package "@shadanai/openclaw" "npm" "$NPM_GLOBAL"
+  check_global_package "@qqbrowser/openclaw-qbot" "npm" "$NPM_GLOBAL"
 
   # Also check all global with deep dependencies
   NPM_GLOBAL_DEEP=$(npm list -g --all 2>/dev/null || true)
@@ -320,6 +347,8 @@ if command -v yarn &>/dev/null; then
   check_global_package "axios@1.14.1" "yarn" "$YARN_GLOBAL"
   check_global_package "axios@0.30.4" "yarn" "$YARN_GLOBAL"
   check_global_package "plain-crypto-js" "yarn" "$YARN_GLOBAL"
+  check_global_package "@shadanai/openclaw" "yarn" "$YARN_GLOBAL"
+  check_global_package "@qqbrowser/openclaw-qbot" "yarn" "$YARN_GLOBAL"
 fi
 
 # pnpm global
@@ -329,6 +358,8 @@ if command -v pnpm &>/dev/null; then
   check_global_package "axios@1.14.1" "pnpm" "$PNPM_GLOBAL"
   check_global_package "axios@0.30.4" "pnpm" "$PNPM_GLOBAL"
   check_global_package "plain-crypto-js" "pnpm" "$PNPM_GLOBAL"
+  check_global_package "@shadanai/openclaw" "pnpm" "$PNPM_GLOBAL"
+  check_global_package "@qqbrowser/openclaw-qbot" "pnpm" "$PNPM_GLOBAL"
 fi
 
 # bun global
@@ -364,6 +395,15 @@ if command -v npm &>/dev/null; then
     else
       safe "npm cache clean of plain-crypto-js"
     fi
+
+    # Check for related malicious packages in cache
+    for bad_pkg in "@shadanai/openclaw" "@qqbrowser/openclaw-qbot"; do
+      BAD_CACHE=$(find "$NPM_CACHE_DIR/_cacache" -name "*.json" -exec grep -l "$bad_pkg" {} \; 2>/dev/null | head -10 || true)
+      if [[ -n "$BAD_CACHE" ]]; then
+        warn "$bad_pkg found in npm cache:"
+        echo "$BAD_CACHE" | sed 's/^/    /'
+      fi
+    done
 
     CACHE_AXIOS=$(find "$NPM_CACHE_DIR/_cacache" -name "*.json" -exec grep -El '"axios","version":"1\.14\.1"|"axios","version":"0\.30\.4"' {} \; 2>/dev/null | head -20 || true)
     if [[ -n "$CACHE_AXIOS" ]]; then
@@ -509,6 +549,16 @@ scan_lockfile() {
     hit=1
   fi
 
+  # Check for related malicious packages (Socket advisory 2026-03-31)
+  if grep -q "@shadanai/openclaw" "$lockfile" 2>/dev/null; then
+    found "@shadanai/openclaw in $lockfile — vendored plain-crypto-js trojan"
+    hit=1
+  fi
+  if grep -q "@qqbrowser/openclaw-qbot" "$lockfile" 2>/dev/null; then
+    found "@qqbrowser/openclaw-qbot in $lockfile — ships tampered axios with plain-crypto-js"
+    hit=1
+  fi
+
   if [[ $hit -eq 0 ]]; then
     LOCKFILE_COUNT=$((LOCKFILE_COUNT + 1))
   fi
@@ -566,6 +616,32 @@ while IFS= read -r -d '' nm_dir; do
         warn "package.json has NO postinstall — likely swapped by anti-forensics (package.md → package.json)"
         warn "This means the payload ALREADY EXECUTED on this system"
       fi
+    fi
+  fi
+
+  # Check for related malicious packages
+  if [[ -d "$nm_dir/@shadanai/openclaw" ]]; then
+    found "@shadanai/openclaw installed at $nm_dir/@shadanai/openclaw"
+    if [[ -f "$nm_dir/@shadanai/openclaw/package.json" ]]; then
+      OPENCLAW_VER=$(node -e "console.log(require(process.argv[1]).version)" "$nm_dir/@shadanai/openclaw/package.json" 2>/dev/null || echo "unknown")
+      info "Version: $OPENCLAW_VER"
+    fi
+    # This package vendors plain-crypto-js deep in its tree
+    VENDORED_TROJAN=$(find "$nm_dir/@shadanai/openclaw" -name "setup.js" -path "*/plain-crypto-js/*" 2>/dev/null | head -3 || true)
+    if [[ -n "$VENDORED_TROJAN" ]]; then
+      found "Vendored plain-crypto-js trojan found inside @shadanai/openclaw:"
+      echo "$VENDORED_TROJAN" | sed 's/^/    /'
+    fi
+  fi
+  if [[ -d "$nm_dir/@qqbrowser/openclaw-qbot" ]]; then
+    found "@qqbrowser/openclaw-qbot installed at $nm_dir/@qqbrowser/openclaw-qbot"
+    # This package ships a tampered axios@1.14.1 with plain-crypto-js injected
+    if [[ -d "$nm_dir/@qqbrowser/openclaw-qbot/node_modules/axios" ]]; then
+      VENDORED_AXIOS=$(node -e "console.log(require(process.argv[1]).version)" "$nm_dir/@qqbrowser/openclaw-qbot/node_modules/axios/package.json" 2>/dev/null || echo "unknown")
+      found "Vendored axios@$VENDORED_AXIOS inside @qqbrowser/openclaw-qbot"
+    fi
+    if find "$nm_dir/@qqbrowser/openclaw-qbot" -path "*/plain-crypto-js" -type d 2>/dev/null | grep -q .; then
+      found "plain-crypto-js found inside @qqbrowser/openclaw-qbot tree"
     fi
   fi
 
@@ -638,14 +714,14 @@ if [[ $FOUND_ISSUES -gt 0 ]]; then
   echo -e "${YELLOW}Immediate actions:${NC}"
   echo "  1. Disconnect from the network if stage-2 IOCs were found"
   echo "  2. Remove compromised packages: npm uninstall axios && npm install axios@1.14.0"
-  echo "  3. Delete plain-crypto-js from all node_modules"
+  echo "  3. Delete plain-crypto-js, @shadanai/openclaw, @qqbrowser/openclaw-qbot from all node_modules"
   echo "  4. Remove stage-2 payloads:"
   echo "     • macOS: sudo rm -f /Library/Caches/com.apple.act.mond"
   echo "     • Linux: rm -f /tmp/ld.py"
   echo "     • Windows: del %PROGRAMDATA%\\wt.exe, %TEMP%\\6202033.*"
   echo "  5. Clean npm cache: npm cache clean --force"
   echo "  6. ROTATE ALL CREDENTIALS — tokens, API keys, SSH keys, passwords"
-  echo "  7. Block sfrclak.com at your DNS/firewall"
+  echo "  7. Block sfrclak.com and 142.11.206.73 at your DNS/firewall"
   echo "  8. Check CI/CD pipelines for the same compromise"
   echo ""
 else
@@ -655,7 +731,7 @@ else
   echo "  • Pin axios to 1.14.0 in your lockfiles"
   echo "  • Run: npm audit"
   echo "  • Consider enabling npm's --ignore-scripts for untrusted installs"
-  echo "  • Block sfrclak.com at your DNS/firewall as a precaution"
+  echo "  • Block sfrclak.com and 142.11.206.73 at your DNS/firewall as a precaution"
 fi
 
 echo ""
