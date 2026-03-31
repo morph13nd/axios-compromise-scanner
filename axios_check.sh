@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # ============================================================================
 # Axios Supply-Chain Compromise Scanner
+# Author: morph13nd from cyberreplay.com
 # Date: 2026-03-31
-# Based on: https://gist.github.com/joe-desimone/36061dabd2bc2913705e0d083a9673e7
+# Based on: https://gist.github.com/joe-desimone/36061dabd2bc2513705e0d083a9673e7
 #
 # Scans for:
 #   1. Compromised axios versions (1.14.1, 0.30.4) in lockfiles & node_modules
-#   2. Malicious packages: plain-crypto-js, @shadanai/openclaw, @qqbrowser/openclaw-qbot
+#   2. Malicious packages: plain-crypto-js
 #   3. Platform-specific stage-2 payload IOCs (filesystem)
 #   4. Active C2 connections to sfrclak.com / 142.11.206.73
 #   5. Global npm/yarn/pnpm packages
@@ -145,7 +146,8 @@ section "Checking for active connections to C2 / exfiltration domains"
 #     POST /product0      — macOS payload
 #     POST /product1      — Windows payload
 #     POST /product2      — Linux payload
-C2_DOMAINS=("sfrclak" "packages.npm.org" "142.11.206.73")
+# Additional domains observed in Socket research: nrwise.com / callnrwise.com (check these too)
+C2_DOMAINS=("sfrclak" "packages.npm.org" "142.11.206.73" "nrwise" "callnrwise")
 C2_FOUND=0
 
 check_net_tool() {
@@ -184,6 +186,14 @@ if [[ "$OS" == "Darwin" ]] && command -v log &>/dev/null; then
   if [[ -n "$DNS_HITS" ]]; then
     warn "macOS DNS log shows queries for packages.npm.org in last 7 days:"
     echo "$DNS_HITS" | sed 's/^/    /'
+    EXFIL_HIT=1
+  fi
+
+  # Additional macOS unified log check for nrwise / callnrwise (added per Socket IOCs)
+  NRWISE_HITS=$(log show --predicate 'composedMessage CONTAINS "nrwise" OR composedMessage CONTAINS "callnrwise"' --style compact --last 7d 2>/dev/null | head -5 || true)
+  if [[ -n "$NRWISE_HITS" ]]; then
+    warn "macOS DNS/log shows queries for nrwise/callnrwise in last 7 days:"
+    echo "$NRWISE_HITS" | sed 's/^/    /'
     EXFIL_HIT=1
   fi
 fi
@@ -311,6 +321,7 @@ if command -v npm &>/dev/null; then
   check_global_package "axios@1.14.1" "npm" "$NPM_GLOBAL"
   check_global_package "axios@0.30.4" "npm" "$NPM_GLOBAL"
   check_global_package "plain-crypto-js" "npm" "$NPM_GLOBAL"
+  # Also look for related malicious packages observed in research
   check_global_package "@shadanai/openclaw" "npm" "$NPM_GLOBAL"
   check_global_package "@qqbrowser/openclaw-qbot" "npm" "$NPM_GLOBAL"
 
@@ -395,15 +406,6 @@ if command -v npm &>/dev/null; then
     else
       safe "npm cache clean of plain-crypto-js"
     fi
-
-    # Check for related malicious packages in cache
-    for bad_pkg in "@shadanai/openclaw" "@qqbrowser/openclaw-qbot"; do
-      BAD_CACHE=$(find "$NPM_CACHE_DIR/_cacache" -name "*.json" -exec grep -l "$bad_pkg" {} \; 2>/dev/null | head -10 || true)
-      if [[ -n "$BAD_CACHE" ]]; then
-        warn "$bad_pkg found in npm cache:"
-        echo "$BAD_CACHE" | sed 's/^/    /'
-      fi
-    done
 
     CACHE_AXIOS=$(find "$NPM_CACHE_DIR/_cacache" -name "*.json" -exec grep -El '"axios","version":"1\.14\.1"|"axios","version":"0\.30\.4"' {} \; 2>/dev/null | head -20 || true)
     if [[ -n "$CACHE_AXIOS" ]]; then
@@ -548,14 +550,15 @@ scan_lockfile() {
     found "plain-crypto-js in $lockfile — THIS PACKAGE IS MALICIOUS"
     hit=1
   fi
-
-  # Check for related malicious packages (Socket advisory 2026-03-31)
-  if grep -q "@shadanai/openclaw" "$lockfile" 2>/dev/null; then
-    found "@shadanai/openclaw in $lockfile — vendored plain-crypto-js trojan"
+  # Check specifically for malicious plain-crypto-js versions (4.2.1 and 4.2.0)
+  if grep -E "plain-crypto-js[^[:alnum:]\n]*4\\.2\\.1|plain-crypto-js[^[:alnum:]\n]*4\\.2\\.0" "$lockfile" 2>/dev/null; then
+    found "plain-crypto-js@4.2.x referenced in $lockfile — MALICIOUS VERSION"
     hit=1
   fi
-  if grep -q "@qqbrowser/openclaw-qbot" "$lockfile" 2>/dev/null; then
-    found "@qqbrowser/openclaw-qbot in $lockfile — ships tampered axios with plain-crypto-js"
+  
+  # Check for vendor/packaged references observed in research
+  if grep -q "@shadanai/openclaw" "$lockfile" 2>/dev/null || grep -q "openclaw-qbot" "$lockfile" 2>/dev/null; then
+    found "Potentially malicious package reference in $lockfile (@shadanai/openclaw or openclaw-qbot)"
     hit=1
   fi
 
@@ -619,32 +622,6 @@ while IFS= read -r -d '' nm_dir; do
     fi
   fi
 
-  # Check for related malicious packages
-  if [[ -d "$nm_dir/@shadanai/openclaw" ]]; then
-    found "@shadanai/openclaw installed at $nm_dir/@shadanai/openclaw"
-    if [[ -f "$nm_dir/@shadanai/openclaw/package.json" ]]; then
-      OPENCLAW_VER=$(node -e "console.log(require(process.argv[1]).version)" "$nm_dir/@shadanai/openclaw/package.json" 2>/dev/null || echo "unknown")
-      info "Version: $OPENCLAW_VER"
-    fi
-    # This package vendors plain-crypto-js deep in its tree
-    VENDORED_TROJAN=$(find "$nm_dir/@shadanai/openclaw" -name "setup.js" -path "*/plain-crypto-js/*" 2>/dev/null | head -3 || true)
-    if [[ -n "$VENDORED_TROJAN" ]]; then
-      found "Vendored plain-crypto-js trojan found inside @shadanai/openclaw:"
-      echo "$VENDORED_TROJAN" | sed 's/^/    /'
-    fi
-  fi
-  if [[ -d "$nm_dir/@qqbrowser/openclaw-qbot" ]]; then
-    found "@qqbrowser/openclaw-qbot installed at $nm_dir/@qqbrowser/openclaw-qbot"
-    # This package ships a tampered axios@1.14.1 with plain-crypto-js injected
-    if [[ -d "$nm_dir/@qqbrowser/openclaw-qbot/node_modules/axios" ]]; then
-      VENDORED_AXIOS=$(node -e "console.log(require(process.argv[1]).version)" "$nm_dir/@qqbrowser/openclaw-qbot/node_modules/axios/package.json" 2>/dev/null || echo "unknown")
-      found "Vendored axios@$VENDORED_AXIOS inside @qqbrowser/openclaw-qbot"
-    fi
-    if find "$nm_dir/@qqbrowser/openclaw-qbot" -path "*/plain-crypto-js" -type d 2>/dev/null | grep -q .; then
-      found "plain-crypto-js found inside @qqbrowser/openclaw-qbot tree"
-    fi
-  fi
-
   # Check axios version
   if [[ -f "$nm_dir/axios/package.json" ]]; then
     AXIOS_VER=$(node -e "try{console.log(require(process.argv[1]).version)}catch(e){console.log('parse-error')}" "$nm_dir/axios/package.json" 2>/dev/null || true)
@@ -671,7 +648,7 @@ PROC_HIT=0
 if command -v ps &>/dev/null; then
   PS_OUTPUT=$(ps aux 2>/dev/null || true)
 
-  for pattern in "com.apple.act.mond" "ld.py" "6202033" "sfrclak" "packages.npm.org" "wt.exe.*hidden"; do
+  for pattern in "com.apple.act.mond" "ld.py" "6202033" "sfrclak" "packages.npm.org" "wt.exe.*hidden" "nrwise" "callnrwise" "jasonsaayman"; do
     if echo "$PS_OUTPUT" | grep -v "grep" | grep -qi "$pattern"; then
       found "Suspicious process matching '$pattern':"
       echo "$PS_OUTPUT" | grep -i "$pattern" | grep -v "grep" | sed 's/^/    /'
@@ -714,14 +691,15 @@ if [[ $FOUND_ISSUES -gt 0 ]]; then
   echo -e "${YELLOW}Immediate actions:${NC}"
   echo "  1. Disconnect from the network if stage-2 IOCs were found"
   echo "  2. Remove compromised packages: npm uninstall axios && npm install axios@1.14.0"
-  echo "  3. Delete plain-crypto-js, @shadanai/openclaw, @qqbrowser/openclaw-qbot from all node_modules"
+  echo "  3. Delete plain-crypto-js from all node_modules"
+  echo "  4. Remove related malicious packages if present: npm uninstall @shadanai/openclaw @qqbrowser/openclaw-qbot"
   echo "  4. Remove stage-2 payloads:"
   echo "     • macOS: sudo rm -f /Library/Caches/com.apple.act.mond"
   echo "     • Linux: rm -f /tmp/ld.py"
   echo "     • Windows: del %PROGRAMDATA%\\wt.exe, %TEMP%\\6202033.*"
   echo "  5. Clean npm cache: npm cache clean --force"
   echo "  6. ROTATE ALL CREDENTIALS — tokens, API keys, SSH keys, passwords"
-  echo "  7. Block sfrclak.com and 142.11.206.73 at your DNS/firewall"
+  echo "  7. Block sfrclak.com at your DNS/firewall"
   echo "  8. Check CI/CD pipelines for the same compromise"
   echo ""
 else
@@ -731,7 +709,7 @@ else
   echo "  • Pin axios to 1.14.0 in your lockfiles"
   echo "  • Run: npm audit"
   echo "  • Consider enabling npm's --ignore-scripts for untrusted installs"
-  echo "  • Block sfrclak.com and 142.11.206.73 at your DNS/firewall as a precaution"
+  echo "  • Block sfrclak.com at your DNS/firewall as a precaution"
 fi
 
 echo ""
